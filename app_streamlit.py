@@ -457,7 +457,7 @@ def main():
 
     col_map, col_selector = st.columns([2.2, 1])
 
-    with col_Selector_Container := col_selector:
+    with col_selector:
         st.subheader("🎯 Odaberi lokaciju za inspekciju")
         if df_filtered.empty:
             st.warning("Nema lokacija za odabrane filtere.")
