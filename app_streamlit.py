@@ -94,20 +94,19 @@ def assign_approx_zupanija(lon: float, lat: float) -> str:
 
 @st.cache_data(ttl=3600)
 def load_lightweight_metadata() -> pd.DataFrame:
-    """Loads metadata_index.parquet directly from your new Hugging Face dataset repository."""
+    """Loads metadata_index.parquet directly from Hugging Face with error reporting."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     try:
-        # POINT TO YOUR NEW REPO AND FILENAME HERE:
         local_path = hf_hub_download(
-            repo_id="SilvioS/metafornow",              # Your new HF repository
-            filename="metadata_index.parquet",          # Name of your uploaded file
+            repo_id="SilvioS/metafornow",
+            filename="metadata_index.parquet",
             repo_type="dataset",
             local_dir=CACHE_DIR,
             token=HF_TOKEN
         )
         df = pd.read_parquet(local_path)
     except Exception as e:
-        st.error(f"Greška pri preuzimanju 'metadata_index.parquet' s Hugging Face-a: {e}")
+        st.error(f"⚠️ Detektirana greška pri učitavanju metatačaka: {str(e)}")
         return pd.DataFrame()
 
     if not df.empty:
