@@ -428,3 +428,294 @@ def main():
             default=all_buckets,
             format_func=lambda b: TRIAGE_UI_MAP[b]["label"]
         )
+
+        max_map_pins = st.slider("Maksimalan broj točaka na karti (za brzinu):", 100, 1000, 400, 100)
+
+        st.divider()
+        if st.button("🧹 Očisti predmemoriju slika", use_container_width=True):
+            fetch_cluster_cache_bucket.clear()
+            plt.close("all")
+            gc.collect()
+            st.toast("Predmemorija slika je očišćena!")
+
+    # Apply Sidebar Filters using boolean mask (avoids unnecessary DataFrame copies)
+    mask = (
+        df_meta["image_year"].isin(selected_years) &
+        df_meta["corine_class"].isin(selected_corine) &
+        (df_meta[size_metric_col] >= min_size_m2) &
+        df_meta["ens_triage_bucket"].isin(selected_buckets)
+    )
+    if selected_zup != "Sve županije (Cijela Hrvatska)":
+        mask &= (df_meta["zupanija"] == selected_zup)
+
+    if selected_scanner == "Samo AerialWaste (Toplinska mapa / CAM >= 50%)":
+        mask &= ((df_meta["aw_out3_cam_global_max"] >= 0.50) | (df_meta["aw_out1_global_waste_prob"] >= 0.40))
+    elif selected_scanner == "Samo SigLIP / SkyCLIP (Tekstura tla / Rubble)":
+        mask &= ((df_meta["siglip_out6_total_waste_max"] >= 0.45) | (df_meta["skyclip_out6_total_waste_max"] >= 0.45))
+    elif selected_scanner == "Samo Detektori objekata (OWLv2 / YOLO-World hrpe)":
+        mask &= ((df_meta["owlv2_out9_total_waste_max_score"] >= 0.20) | (df_meta["yoloworld_out9_total_waste_max_score"] >= 0.20))
+
+    df_filtered = df_meta.loc[mask].sort_values(by="ens_active_learning_score", ascending=False)
+
+    current_filter_sig = (
+        selected_zup,
+        tuple(selected_years),
+        tuple(selected_corine),
+        selected_scanner,
+        size_metric_col,
+        min_size_m2,
+        tuple(selected_buckets)
+    )
+    if st.session_state.get("last_filter_sig") != current_filter_sig:
+        st.session_state["last_filter_sig"] = current_filter_sig
+        if not df_filtered.empty and st.session_state["selected_cluster_id"] not in df_filtered["cluster_id"].values:
+            st.session_state["selected_cluster_id"] = int(df_filtered["cluster_id"].iloc[0])
+
+    # --------------------------------------------------------------------------
+    # TOP SECTION: SUMMARY KPIS & FOLIUM MAP
+    # --------------------------------------------------------------------------
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("Ukupno snimaka u filteru", len(df_filtered))
+    kpi2.metric("Unikatnih ELOO lokacija", df_filtered["cluster_id"].nunique())
+    kpi3.metric("🟠 Zahtijeva provjeru", int((df_filtered["ens_triage_bucket"] == "ROUTE_TO_CROWD_DISAGREEMENT").sum()))
+    kpi4.metric("🔴 Potvrđeni otpad", int((df_filtered["ens_triage_bucket"] == "AUTO_VERIFIED_WASTE").sum()))
+
+    cluster_summary = df_filtered.drop_duplicates(subset=["cluster_id"], keep="first")
+
+    col_map, col_selector = st.columns([2.2, 1])
+
+    with col_selector:
+        st.subheader("🎯 Odaberi ili upiši lokaciju")
+
+        with st.form("direct_cluster_jump_form", clear_on_submit=False):
+            st.caption("🔎 **Izravan skok na lokaciju** (zaobilazi sve filtere):")
+            j_col1, j_col2 = st.columns([1.8, 1])
+            raw_jump_id = j_col1.text_input(
+                "Upiši broj lokacije (Cluster ID):",
+                placeholder="npr. 1868",
+                label_visibility="collapsed"
+            )
+            jump_submitted = j_col2.form_submit_button("Učitaj", use_container_width=True, type="primary")
+
+            if jump_submitted and raw_jump_id.strip():
+                clean_str = raw_jump_id.strip().lstrip("#")
+                if clean_str.lstrip("-").isdigit():
+                    target_cid = int(clean_str)
+                    if target_cid in df_meta["cluster_id"].values:
+                        st.session_state["selected_cluster_id"] = target_cid
+                    else:
+                        st.warning(f"⚠️ Lokacija #{target_cid} ne postoji u bazi podataka.")
+                else:
+                    st.warning("⚠️ Unesite samo broj lokacije (npr. 1868).")
+
+        filtered_cids = cluster_summary["cluster_id"].astype(int).tolist()
+        active_cid = int(st.session_state["selected_cluster_id"])
+
+        if active_cid not in filtered_cids:
+            cid_list = [active_cid] + filtered_cids
+        else:
+            cid_list = filtered_cids
+
+        selected_cluster_id = st.selectbox(
+            "Filtrirane lokacije (ili aktivni izravni unos):",
+            options=cid_list,
+            index=cid_list.index(active_cid),
+            format_func=lambda cid: (
+                f"Lokacija #{cid} 📌 (Izravni unos — izvan filtera)"
+                if cid not in filtered_cids else f"Lokacija #{cid}"
+            )
+        )
+        st.session_state["selected_cluster_id"] = int(selected_cluster_id)
+
+        df_cluster_history = df_meta[df_meta["cluster_id"] == selected_cluster_id].sort_values("image_year")
+
+        st.markdown("**📅 Povijest sumnjive površine kroz godine (m²):**")
+        history_chart_df = df_cluster_history[["image_year", "max_detected_area_m2"]].set_index("image_year")
+        history_chart_df.columns = ["Maks. detektirana površina (m²)"]
+        st.bar_chart(history_chart_df, height=165, color="#ff7f0e")
+
+    with col_map:
+        st.caption(f"🗺️ Interaktivna karta (prikazano top {min(len(cluster_summary), max_map_pins)} filtriranih lokacija — **kliknite na točku za učitavanje**):")
+        active_lat = float(df_cluster_history.iloc[-1]["centroid_lat"])
+        active_lon = float(df_cluster_history.iloc[-1]["centroid_lon"])
+
+        m = folium.Map(location=[active_lat, active_lon], zoom_start=12, tiles=None)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery",
+            name="Satelitska snimka",
+            max_zoom=19,
+        ).add_to(m)
+
+        map_subset = cluster_summary.head(max_map_pins)
+        active_drawn = False
+        for row in map_subset.itertuples():
+            cid = int(row.cluster_id)
+            is_active = (cid == selected_cluster_id)
+            if is_active:
+                active_drawn = True
+            folium.CircleMarker(
+                location=[row.centroid_lat, row.centroid_lon],
+                radius=10 if is_active else 6,
+                color="#ffffff" if is_active else row.color_hex,
+                weight=3 if is_active else 1,
+                fill=True,
+                fill_color=row.color_hex,
+                fill_opacity=0.9,
+                tooltip=f"Lokacija #{cid} | {row.status_short} | Max površina: {row.max_detected_area_m2:.0f} m²",
+            ).add_to(m)
+
+        if not active_drawn:
+            latest_active = df_cluster_history.iloc[-1]
+            folium.CircleMarker(
+                location=[float(latest_active["centroid_lat"]), float(latest_active["centroid_lon"])],
+                radius=11,
+                color="#ffffff",
+                weight=3,
+                fill=True,
+                fill_color=latest_active["color_hex"],
+                fill_opacity=0.95,
+                tooltip=f"📌 Lokacija #{selected_cluster_id} (Izravni unos) | {latest_active['status_short']}",
+            ).add_to(m)
+
+        map_data = st_folium(
+            m,
+            key="ecowarden_main_map",
+            height=420,
+            use_container_width=True,
+            returned_objects=["last_object_clicked"]
+        )
+
+        if map_data and map_data.get("last_object_clicked") and not cluster_summary.empty:
+            click_lat = map_data["last_object_clicked"]["lat"]
+            click_lon = map_data["last_object_clicked"]["lng"]
+            dists = (cluster_summary["centroid_lat"] - click_lat) ** 2 + (cluster_summary["centroid_lon"] - click_lon) ** 2
+            nearest_cid = int(cluster_summary.loc[dists.idxmin(), "cluster_id"])
+            if nearest_cid != st.session_state["selected_cluster_id"]:
+                st.session_state["selected_cluster_id"] = nearest_cid
+                st.rerun()
+
+    st.divider()
+
+    # --------------------------------------------------------------------------
+    # BOTTOM SECTION: INSPECTION DESK & 10-LOCATION CACHED GEO FILTERS
+    # --------------------------------------------------------------------------
+    st.header(f"🔍 Inspekcijski stol: Lokacija #{selected_cluster_id}")
+
+    cluster_bucket = fetch_cluster_cache_bucket(selected_cluster_id, json_arrow_table)
+
+    cluster_years = df_cluster_history["image_year"].tolist()
+    if len(cluster_years) > 1:
+        selected_img_year = st.select_slider(
+            "⏳ Vremenski klizač (Trenutni prijelaz između već učitanih godina):",
+            options=cluster_years,
+            value=cluster_years[-1]
+        )
+    else:
+        selected_img_year = cluster_years[0]
+        st.info(f"📅 Dostupna snimka iz godine: **{selected_img_year}**")
+
+    active_row = df_cluster_history[df_cluster_history["image_year"] == selected_img_year].iloc[0]
+    active_payload = cluster_bucket.get(active_row["file_name"], {})
+    bucket_info = TRIAGE_UI_MAP.get(active_row["ens_triage_bucket"], TRIAGE_UI_MAP["ROUTE_TO_CROWD_AMBIGUOUS"])
+
+    desk_left, desk_right = st.columns([1.6, 1])
+
+    with desk_left:
+        active_filter = st.radio(
+            "🎨 Odaberi Geo Filter (Trenutni prijelaz bez ponovnog učitavanja):",
+            options=[
+                "📸 Originalna snimka",
+                "🔥 Toplinska mapa (Heatmap)",
+                "🟩 Skener terena (Pločice)",
+                "🎯 Detekcija hrpa (Okviri)",
+                "🎛️ Kombinirani prikaz"
+            ],
+            horizontal=True
+        )
+
+        pyramid_scale = "L0_384px"
+        tile_thresh = 0.45
+        if active_filter == "🟩 Skener terena (Pločice)":
+            sub_c1, sub_c2 = st.columns(2)
+            pyramid_scale = sub_c1.selectbox("Veličina mreže:", options=["L0_384px", "L1_768px", "Sve razine"])
+            tile_thresh = sub_c2.slider("Prag osjetljivosti:", 0.20, 0.90, 0.45, 0.05)
+
+        fig = render_geo_filter_view(
+            payload=active_payload,
+            meta_row=active_row,
+            active_filter=active_filter,
+            pyramid_scale=pyramid_scale,
+            tile_threshold=tile_thresh
+        )
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+        gc.collect()
+
+    with desk_right:
+        st.subheader("🧠 Što AI modeli vide na ovoj snimci?")
+        st.markdown(
+            f"<div style='padding:14px; border-radius:8px; border-left: 6px solid {bucket_info['color']}; background-color: rgba(128,128,128,0.1);'>"
+            f"<h4 style='margin:0;'>{bucket_info['label']}</h4>"
+            f"<p style='margin-top:8px; margin-bottom:0; font-size:14px;'>{bucket_info['explanation']}</p>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        st.write("")
+        m1, m2 = st.columns(2)
+        m1.metric("Ukupni AI indeks sumnje", f"{active_row['warden_confidence_pct']}%")
+        m2.metric("Neslaganje između modela", f"{active_row['disagreement_pct']}%")
+
+        m3, m4 = st.columns(2)
+        m3.metric("Dominantni tip (AI)", str(active_row["siglip_out11_primary_waste_type"]))
+        m4.metric("Maks. detektirana površina", f"{active_row['max_detected_area_m2']:.0f} m²")
+
+        with st.expander("📊 Detaljni rezultati po vrsti AI skenera", expanded=True):
+            st.caption("Vršni (lokalni) rezultati po pojedinom skeneru na ovoj snimci:")
+            st.progress(
+                float(np.clip(active_row["siglip_out6_total_waste_max"], 0.0, 1.0)),
+                text=f"Skener teksture tla (SigLIP): {active_row['siglip_out6_total_waste_max']:.0%} ({active_row['siglip_out10_suspect_area_m2']:.0f} m²)"
+            )
+            st.progress(
+                float(np.clip(active_row["skyclip_out6_total_waste_max"], 0.0, 1.0)),
+                text=f"Satelitski skener (SkyCLIP): {active_row['skyclip_out6_total_waste_max']:.0%}"
+            )
+            aw_peak = float(np.clip(active_row.get("aw_out3_cam_global_max", active_row["aw_out1_global_waste_prob"]), 0.0, 1.0))
+            st.progress(
+                aw_peak,
+                text=f"Toplinska mapa (AerialWaste CAM vrh): {aw_peak:.0%} (Žarište: {active_row['aw_hotspot_area_m2']:.0f} m² | Globalno: {active_row['aw_out1_global_waste_prob']:.0%})"
+            )
+            st.progress(
+                float(np.clip(active_row["owlv2_out9_total_waste_max_score"], 0.0, 1.0)),
+                text=f"Detektor hrpa (OWLv2): {active_row['owlv2_out9_total_waste_max_score']:.0%} ({active_row['owlv2_out10_total_waste_box_count']} okvira)"
+            )
+            st.progress(
+                float(np.clip(active_row["yoloworld_out9_total_waste_max_score"], 0.0, 1.0)),
+                text=f"Detektor objekata (YOLO-World): {active_row['yoloworld_out9_total_waste_max_score']:.0%} ({active_row['yoloworld_out10_total_waste_box_count']} okvira)"
+            )
+
+        gmaps_url = f"https://www.google.com/maps/@{active_row['centroid_lat']},{active_row['centroid_lon']},18z/data=!3m1!1e3"
+        st.markdown(
+            f"**CORINE Tip:** {active_row['corine_class']}  \n"
+            f"**GPS:** `{active_row['centroid_lat']:.6f}, {active_row['centroid_lon']:.6f}`  \n"
+            f"[🌍 Otvori u Google Maps (Satelitski prikaz)]({gmaps_url})"
+        )
+
+        st.divider()
+        st.subheader("✍️ Odluka komunalnog redara")
+        verdict = None
+        col_b1, col_b2, col_b3 = st.columns(3)
+        if col_b1.button("✅ Potvrdi otpad", use_container_width=True, type="primary"):
+            verdict = "CONFIRMED_WASTE"
+        if col_b2.button("🚗 Lažni alarm", use_container_width=True):
+            verdict = "FALSE_ALARM"
+        if col_b3.button("🌲 Čisto", use_container_width=True):
+            verdict = "CLEAN"
+
+        if verdict:
+            st.success(f"Zabilježeno: {verdict}")
+
+
+if __name__ == "__main__":
+    main()
