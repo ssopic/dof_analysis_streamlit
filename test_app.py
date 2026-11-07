@@ -10,8 +10,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import pyarrow.parquet as pq
 import streamlit as st
-import pydeck as pdk
-from huggingface_hub import HfApi, hf_hub_download
+import folium
+from streamlit_folium import st_folium
+from huggingface_hub import hf_hub_download
 
 # ==============================================================================
 # 1. PAGE CONFIGURATION & CONSTANTS
@@ -23,59 +24,59 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+META_REPO_ID = "SilvioS/metafornow"
+META_FILENAME = "metadata_index.parquet"
 PROD_REPO_ID = "SilvioS/eloo_dgu_scanner_output"
 TEST_REPO_ID = "SilvioS/eloo_dgu_triage_results"
-HF_TOKEN = os.environ.get("HF_TOKEN") or st.secrets.get("HF_TOKEN", None)
+
+# Safely check environment variables or Streamlit secrets for HF_TOKEN
+try:
+    HF_TOKEN = os.environ.get("HF_TOKEN") or st.secrets.get("HF_TOKEN", None)
+except Exception:
+    HF_TOKEN = os.environ.get("HF_TOKEN", None)
+
 CACHE_DIR = "./hf_streamlit_cache"
 
-# Standardized semantic colors from WardenViz
 SEMANTIC_CLASS_COLORS = {
-    "Clean Nature":        "#2ca02c",  # Green
-    "Urban / Roofs":       "#1f77b4",  # Blue
-    "Natural Karst Rock":  "#7f7f7f",  # Gray
-    "Construction Rubble": "#ff7f0e",  # Orange
-    "Municipal Garbage":   "#d62728",  # Red
-    "Tires / Bulky Waste": "#9467bd",  # Purple
-    "Unknown":             "#17becf"   # Cyan
+    "Clean Nature":        "#2ca02c",
+    "Urban / Roofs":       "#1f77b4",
+    "Natural Karst Rock":  "#7f7f7f",
+    "Construction Rubble": "#ff7f0e",
+    "Municipal Garbage":   "#d62728",
+    "Tires / Bulky Waste": "#9467bd",
+    "Unknown":             "#17becf"
 }
 
-# User-friendly translations for non-technical Wardens
 TRIAGE_UI_MAP = {
     "AUTO_VERIFIED_WASTE": {
         "label": "🔴 Visoka vjerojatnost otpada (Potvrđeno)",
         "short": "Potvrđeni otpad",
-        "color": [214, 39, 40, 210],
-        "hex": "#d62728",
-        "explanation": "Svi AI skeneri (i teksturni i objektni) snažno se slažu da se na ovoj lokaciji nalazi odlagalište otpada."
+        "color": "#d62728",
+        "explanation": "Svi AI skeneri snažno se slažu da se na ovoj lokaciji nalazi odlagalište otpada."
     },
     "ROUTE_TO_CROWD_DISAGREEMENT": {
         "label": "🟠 Potrebna provjera (Neslaganje modela)",
         "short": "Potrebna provjera",
-        "color": [255, 127, 14, 210],
-        "hex": "#ff7f0e",
+        "color": "#ff7f0e",
         "explanation": (
-            "Skeneri terena vide sumnjivu teksturu (npr. građevinski šut ili iskop), "
-            "dok detektori objekata ne vide jasne hrpe. **Napomena:** Ovo se često događa "
-            "u urbanim zonama, zbog žutih automobila, krovova ili prirodnog krša. Provjerite pomoću Geo Filtera!"
+            "Skeneri terena ili toplinska mapa vide sumnjivu promjenu na tlu, "
+            "dok detektori pojedinačnih objekata nisu sigurni. Provjerite lokaciju pomoću Geo Filtera!"
         )
     },
     "ROUTE_TO_CROWD_AMBIGUOUS": {
         "label": "🟡 Granični slučaj (Srednja sigurnost)",
         "short": "Granični slučaj",
-        "color": [230, 184, 0, 210],
-        "hex": "#e6b800",
-        "explanation": "Modeli su umjereno nesigurni jer lokacija izgleda granično. Preporučuje se vizualni pregled."
+        "color": "#e6b800",
+        "explanation": "Modeli su umjereno nesigurni. Preporučuje se vizualni pregled."
     },
     "AUTO_CLEAN": {
         "label": "🟢 Čisto područje (Nizak rizik)",
         "short": "Čisto područje",
-        "color": [44, 160, 44, 180],
-        "hex": "#2ca02c",
-        "explanation": "Svi modeli se slažu da snimka prikazuje čistu prirodu, uobičajene krovove ili prirodni krš."
+        "color": "#2ca02c",
+        "explanation": "Svi modeli se slažu da snimka prikazuje čistu prirodu ili normalne objekte."
     }
 }
 
-# Approximate bounding boxes [lon_min, lat_min, lon_max, lat_max] for Croatian Županije
 ZUPANIJE_BBOX = {
     "Sve županije (Cijela Hrvatska)": [13.4, 42.3, 19.5, 46.6],
     "Grad Zagreb i Zagrebačka": [15.3, 45.4, 16.7, 46.1],
@@ -90,11 +91,13 @@ ZUPANIJE_BBOX = {
     "Dubrovačko-neretvanska": [16.5, 42.3, 18.6, 43.2],
 }
 
-LIGHTWEIGHT_META_COLS = [
+# Only load lightweight scalar columns into RAM on boot (NO JSON strings in global table!)
+SCALAR_META_COLS = [
     "chunk_id", "file_name", "cluster_id", "image_year",
-    "corine_class", "centroid_lon", "centroid_lat",
-    "img_width_px", "img_height_px", "meters_per_pixel",
-    "aw_out1_global_waste_prob", "aw_out4_cam_area_pct_gt_05",
+    "corine_code", "corine_class", "centroid_lon", "centroid_lat",
+    "img_width_px", "img_height_px", "meters_per_pixel", "repo_image_path",
+    "aw_out1_global_waste_prob", "aw_out2_cam_global_mean",
+    "aw_out3_cam_global_max", "aw_out4_cam_area_pct_gt_05",
     "siglip_out6_total_waste_max", "siglip_out10_suspect_area_m2",
     "siglip_out11_primary_waste_type", "skyclip_out6_total_waste_max",
     "owlv2_out9_total_waste_max_score", "owlv2_out10_total_waste_box_count",
@@ -102,12 +105,13 @@ LIGHTWEIGHT_META_COLS = [
     "yoloworld_out9_total_waste_max_score", "yoloworld_out10_total_waste_box_count",
     "yoloworld_out11_detected_boxes_area_m2",
     "ens_mean_waste_prob", "ens_max_min_diff",
-    "ens_active_learning_score", "ens_triage_bucket"
+    "ens_active_learning_score", "ens_triage_bucket",
+    "aw_hotspot_area_m2", "max_detected_area_m2", "_source_repo"
 ]
 
 
 # ==============================================================================
-# 2. DATA LOADING & LAZY IMAGE EXTRACTION (ALL CHUNKS AUTOMATIC)
+# 2. ULTRA-LOW-RAM METADATA LOADER & 10-CLUSTER CACHE BUCKET
 # ==============================================================================
 def assign_approx_zupanija(lon: float, lat: float) -> str:
     for zup, (lon_min, lat_min, lon_max, lat_max) in ZUPANIJE_BBOX.items():
@@ -118,128 +122,147 @@ def assign_approx_zupanija(lon: float, lat: float) -> str:
     return "Ostale županije"
 
 
-@st.cache_data(ttl=3600, show_spinner="Učitavanje svih lokacija i metapodataka s Hugging Face...")
-def load_lightweight_metadata() -> pd.DataFrame:
+@st.cache_data(ttl=3600, show_spinner="Učitavanje indeksa lokacija s Hugging Face-a...")
+def load_lightweight_metadata() -> tuple[pd.DataFrame, str, list]:
     """
-    Automatically indexes ALL available parquet chunks on Hugging Face
-    using PyArrow column projection (skipping binary image bytes and heavy JSONs).
+    Downloads metadata_index.parquet to local disk, but reads ONLY scalar columns into RAM.
+    Returns (df_meta, local_parquet_path, diagnostic_logs).
     """
+    logs = []
     os.makedirs(CACHE_DIR, exist_ok=True)
-    hf_api = HfApi(token=HF_TOKEN)
-    repo_to_use = PROD_REPO_ID
-
     try:
-        all_files = hf_api.list_repo_files(repo_id=PROD_REPO_ID, repo_type="dataset")
-        pq_files = [f for f in all_files if f.startswith("triage_results/") and f.endswith("_triage.parquet")]
-        if not pq_files:
-            raise FileNotFoundError("No parquet chunks in PROD_REPO_ID")
-    except Exception:
-        repo_to_use = TEST_REPO_ID
-        all_files = hf_api.list_repo_files(repo_id=TEST_REPO_ID, repo_type="dataset")
-        pq_files = [f for f in all_files if f.startswith("triage_results/") and f.endswith("_triage.parquet")]
+        logs.append(f"Preuzimanje {META_REPO_ID}/{META_FILENAME}...")
+        local_path = hf_hub_download(
+            repo_id=META_REPO_ID,
+            filename=META_FILENAME,
+            repo_type="dataset",
+            local_dir=CACHE_DIR,
+            token=HF_TOKEN
+        )
+        logs.append(f"Datoteka preuzeta: {local_path}")
 
-    def _chunk_sort_key(path_str: str):
-        base = os.path.basename(path_str).replace("_triage.parquet", "")
-        parts = base.split("_")
-        return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 999999
+        schema_cols = pq.read_schema(local_path).names
+        cols_to_read = [c for c in SCALAR_META_COLS if c in schema_cols]
+        df = pd.read_parquet(local_path, columns=cols_to_read)
+        logs.append(f"Učitano {len(df)} redaka (samo skalarni stupci, bez teških JSON-a u RAM-u).")
 
-    pq_files = sorted(pq_files, key=_chunk_sort_key)
-
-    dfs = []
-    for pq_subpath in pq_files:
-        try:
-            local_pq = hf_hub_download(
-                repo_id=repo_to_use,
-                filename=pq_subpath,
-                repo_type="dataset",
-                local_dir=CACHE_DIR,
-                token=HF_TOKEN
-            )
-            schema_cols = pq.read_schema(local_pq).names
-            cols_to_read = [c for c in LIGHTWEIGHT_META_COLS if c in schema_cols]
-            df_part = pd.read_parquet(local_pq, columns=cols_to_read)
-            df_part["_source_repo"] = repo_to_use
-            dfs.append(df_part)
-        except Exception:
-            continue
-
-    df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    except Exception as e:
+        logs.append(f"GREŠKA: {type(e).__name__}: {str(e)}")
+        return pd.DataFrame(), "", logs
 
     if not df.empty:
+        # Compute fallback area columns if not already present in parquet
+        if "aw_hotspot_area_m2" not in df.columns:
+            total_area = df["img_width_px"] * df["img_height_px"] * (df["meters_per_pixel"] ** 2)
+            df["aw_hotspot_area_m2"] = (total_area * (df["aw_out4_cam_area_pct_gt_05"] / 100.0)).round(1)
+
+        if "max_detected_area_m2" not in df.columns:
+            df["max_detected_area_m2"] = df[[
+                "aw_hotspot_area_m2",
+                "siglip_out10_suspect_area_m2",
+                "owlv2_out11_detected_boxes_area_m2",
+                "yoloworld_out11_detected_boxes_area_m2"
+            ]].max(axis=1).round(1)
+
+        if "aw_out3_cam_global_max" not in df.columns:
+            df["aw_out3_cam_global_max"] = df["aw_out1_global_waste_prob"]
+
         if "zupanija" not in df.columns:
             df["zupanija"] = [
                 assign_approx_zupanija(lon, lat)
                 for lon, lat in zip(df["centroid_lon"], df["centroid_lat"])
             ]
+
         df["status_label"] = df["ens_triage_bucket"].map(lambda b: TRIAGE_UI_MAP.get(b, TRIAGE_UI_MAP["ROUTE_TO_CROWD_AMBIGUOUS"])["label"])
         df["status_short"] = df["ens_triage_bucket"].map(lambda b: TRIAGE_UI_MAP.get(b, TRIAGE_UI_MAP["ROUTE_TO_CROWD_AMBIGUOUS"])["short"])
-        df["color_rgba"] = df["ens_triage_bucket"].map(lambda b: TRIAGE_UI_MAP.get(b, TRIAGE_UI_MAP["ROUTE_TO_CROWD_AMBIGUOUS"])["color"])
+        df["color_hex"] = df["ens_triage_bucket"].map(lambda b: TRIAGE_UI_MAP.get(b, TRIAGE_UI_MAP["ROUTE_TO_CROWD_AMBIGUOUS"])["color"])
         df["warden_confidence_pct"] = (df["ens_mean_waste_prob"] * 100).round(0).astype(int)
         df["disagreement_pct"] = (df["ens_max_min_diff"] * 100).round(0).astype(int)
 
-    return df
+    return df, local_path, logs
 
 
-def fetch_single_image_payload(chunk_id: str, file_name: str, repo_id: str = PROD_REPO_ID) -> dict:
+@st.cache_data(max_entries=10, show_spinner="Preuzimanje i predmemoriranje svih godina za odabranu lokaciju...")
+def fetch_cluster_cache_bucket(cluster_id: int, meta_parquet_path: str) -> dict:
+    """
+    CACHE BUCKET (stores the last 10 inspected locations!):
+    1. Reads the Geo Filter JSONs for all years of `cluster_id` directly from local `metadata_index.parquet`.
+    2. Downloads ONLY the lightweight ~150KB `.jpg` file (`repo_image_path`) from Hugging Face,
+       avoiding the 82MB chunk parquet files completely!
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
-    remote_subpath = f"triage_results/{chunk_id}_triage.parquet"
-
-    try:
-        local_pq = hf_hub_download(
-            repo_id=repo_id,
-            filename=remote_subpath,
-            repo_type="dataset",
-            local_dir=CACHE_DIR,
-            token=HF_TOKEN
-        )
-    except Exception:
-        local_pq = hf_hub_download(
-            repo_id=TEST_REPO_ID,
-            filename=remote_subpath,
-            repo_type="dataset",
-            local_dir=CACHE_DIR,
-            token=HF_TOKEN
-        )
-
-    heavy_cols = [
-        "file_name", "image_jpeg_bytes", "repo_image_path",
+    json_cols = [
+        "file_name", "chunk_id", "image_year", "repo_image_path",
         "aw_cam_grid_32x32_json", "all_tile_records_json",
         "owlv2_detected_boxes_json", "yoloworld_detected_boxes_json"
     ]
-    df_row = pd.read_parquet(
-        local_pq,
-        columns=heavy_cols,
-        filters=[("file_name", "==", file_name)]
+    schema_cols = pq.read_schema(meta_parquet_path).names
+    cols_to_load = [c for c in json_cols if c in schema_cols]
+
+    df_cluster_jsons = pd.read_parquet(
+        meta_parquet_path,
+        columns=cols_to_load,
+        filters=[("cluster_id", "==", int(cluster_id))]
     )
 
-    if df_row.empty:
-        raise ValueError(f"Slika {file_name} nije pronađena u {chunk_id}.")
+    cluster_payloads = {}
+    for _, row in df_cluster_jsons.iterrows():
+        fname = str(row["file_name"])
+        chunk_id = str(row["chunk_id"])
+        repo_img_path = str(row.get("repo_image_path", f"images/{chunk_id}/{fname}"))
 
-    row = df_row.iloc[0]
+        pil_img = None
+        # Fast path: Download ONLY the ~150KB raw JPEG file from Hugging Face
+        for candidate_repo in [PROD_REPO_ID, TEST_REPO_ID]:
+            try:
+                local_jpg = hf_hub_download(
+                    repo_id=candidate_repo,
+                    filename=repo_img_path,
+                    repo_type="dataset",
+                    local_dir=CACHE_DIR,
+                    token=HF_TOKEN
+                )
+                pil_img = Image.open(local_jpg).convert("RGB")
+                break
+            except Exception:
+                continue
 
-    if row["image_jpeg_bytes"] is not None and len(row["image_jpeg_bytes"]) > 0:
-        pil_img = Image.open(BytesIO(row["image_jpeg_bytes"])).convert("RGB")
-    else:
-        img_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=str(row["repo_image_path"]),
-            repo_type="dataset",
-            local_dir=CACHE_DIR,
-            token=HF_TOKEN
-        )
-        pil_img = Image.open(img_path).convert("RGB")
+        # Fallback path if standalone JPEG wasn't found: extract from chunk parquet
+        if pil_img is None:
+            remote_subpath = f"triage_results/{chunk_id}_triage.parquet"
+            for candidate_repo in [PROD_REPO_ID, TEST_REPO_ID]:
+                try:
+                    local_pq = hf_hub_download(
+                        repo_id=candidate_repo,
+                        filename=remote_subpath,
+                        repo_type="dataset",
+                        local_dir=CACHE_DIR,
+                        token=HF_TOKEN
+                    )
+                    df_img = pd.read_parquet(
+                        local_pq,
+                        columns=["file_name", "image_jpeg_bytes"],
+                        filters=[("file_name", "==", fname)]
+                    )
+                    if not df_img.empty and df_img.iloc[0]["image_jpeg_bytes"]:
+                        pil_img = Image.open(BytesIO(df_img.iloc[0]["image_jpeg_bytes"])).convert("RGB")
+                        break
+                except Exception:
+                    continue
 
-    return {
-        "pil_img": pil_img,
-        "aw_cam_32": np.array(json.loads(row.get("aw_cam_grid_32x32_json", "[]")), dtype=np.float32),
-        "tiles": json.loads(row.get("all_tile_records_json", "[]")),
-        "owlv2_boxes": json.loads(row.get("owlv2_detected_boxes_json", "[]")),
-        "yolo_boxes": json.loads(row.get("yoloworld_detected_boxes_json", "[]")),
-    }
+        cluster_payloads[fname] = {
+            "pil_img": pil_img,
+            "aw_cam_32": np.array(json.loads(row.get("aw_cam_grid_32x32_json", "[]") or "[]"), dtype=np.float32),
+            "tiles": json.loads(row.get("all_tile_records_json", "[]") or "[]"),
+            "owlv2_boxes": json.loads(row.get("owlv2_detected_boxes_json", "[]") or "[]"),
+            "yolo_boxes": json.loads(row.get("yoloworld_detected_boxes_json", "[]") or "[]"),
+        }
+
+    return cluster_payloads
 
 
 # ==============================================================================
-# 3. INSTAGRAM-STYLE "GEO FILTER" RENDERER (ZERO-GPU PIL + MATPLOTLIB)
+# 3. GEO FILTER RENDERER
 # ==============================================================================
 def render_geo_filter_view(
     payload: dict,
@@ -249,10 +272,15 @@ def render_geo_filter_view(
     tile_threshold: float = 0.45,
     box_min_score: float = 0.05
 ) -> plt.Figure:
-    img = payload["pil_img"]
-    w, h = img.size
+    img = payload.get("pil_img")
+    if img is None:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.text(0.5, 0.5, "Slika nije dostupna u repozitoriju", ha="center", va="center")
+        ax.axis("off")
+        return fig
 
-    fig, ax = plt.subplots(figsize=(9, 9), dpi=150)
+    w, h = img.size
+    fig, ax = plt.subplots(figsize=(8.5, 8.5), dpi=140)
     ax.imshow(img)
     ax.axis("off")
 
@@ -270,7 +298,7 @@ def render_geo_filter_view(
             im = ax.imshow(cam_upsampled, cmap="jet", alpha=0.45, vmin=0, vmax=1)
             plt.colorbar(im, ax=ax, fraction=0.042, pad=0.03, label="Intenzitet sumnje (AerialWaste CAM)")
         ax.set_title(
-            f"Geo Filter: Toplinska mapa kontaminacije (Površina >50%: {meta_row['aw_out4_cam_area_pct_gt_05']:.1f}%)",
+            f"Geo Filter: Toplinska mapa (Max intenzitet: {meta_row['aw_out3_cam_global_max']:.0%} | Površina: {meta_row['aw_hotspot_area_m2']:.0f} m²)",
             fontsize=11, fontweight="bold", pad=10
         )
 
@@ -281,42 +309,31 @@ def render_geo_filter_view(
 
         for t in tiles:
             x1, y1, x2, y2 = t["bbox_px"]
-            w_prob = max(
+            # Supports both slimmed JSON ('w_prob', 'dom_cls') and raw JSON keys
+            w_prob = float(t.get("w_prob", max(
                 float(t.get("siglip_out6_total_waste_prob", 0.0)),
                 float(t.get("skyclip_out6_total_waste_prob", 0.0))
-            )
-            dom_cls = t.get("siglip_dominant_class", "Unknown")
+            )))
+            dom_cls = t.get("dom_cls") or t.get("siglip_dominant_class", "Unknown")
             is_flag = w_prob >= tile_threshold
             col = SEMANTIC_CLASS_COLORS.get(dom_cls, "#17becf")
 
             if is_flag:
-                ax.add_patch(patches.Rectangle(
-                    (x1, y1), x2 - x1, y2 - y1,
-                    linewidth=2.2, edgecolor=col, facecolor=col, alpha=0.25
-                ))
+                ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=2.2, edgecolor=col, facecolor=col, alpha=0.25))
                 ax.text(
-                    x1 + 8, y1 + 26,
-                    f"{dom_cls}\n({w_prob:.0%})",
+                    x1 + 8, y1 + 26, f"{dom_cls}\n({w_prob:.0%})",
                     color="white", fontsize=7.5, fontweight="bold",
                     bbox=dict(facecolor=col, alpha=0.8, pad=1.5, edgecolor="none")
                 )
             else:
-                ax.add_patch(patches.Rectangle(
-                    (x1, y1), x2 - x1, y2 - y1,
-                    linewidth=0.6, edgecolor="white", facecolor="none", alpha=0.35
-                ))
-
+                ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=0.6, edgecolor="white", facecolor="none", alpha=0.35))
         ax.set_title(
             f"Geo Filter: Skener terena — Sumnjiva površina: {meta_row['siglip_out10_suspect_area_m2']:.0f} m²",
             fontsize=11, fontweight="bold", pad=10
         )
 
     elif active_filter == "🎯 Detekcija hrpa (Okviri)":
-        all_boxes = [
-            ("OWLv2", b) for b in payload["owlv2_boxes"]
-        ] + [
-            ("YOLO", b) for b in payload["yolo_boxes"]
-        ]
+        all_boxes = [("OWLv2", b) for b in payload["owlv2_boxes"]] + [("YOLO", b) for b in payload["yolo_boxes"]]
         drawn_count = 0
         for model_tag, b in all_boxes:
             score = float(b.get("score", 0.0))
@@ -325,13 +342,9 @@ def render_geo_filter_view(
             drawn_count += 1
             bx1, by1, bx2, by2 = b["bbox_px"]
             col = b.get("color", "#ff7f0e" if model_tag == "OWLv2" else "#d62728")
-            ax.add_patch(patches.Rectangle(
-                (bx1, by1), bx2 - bx1, by2 - by1,
-                linewidth=2.4, edgecolor=col, facecolor=col, alpha=0.22
-            ))
+            ax.add_patch(patches.Rectangle((bx1, by1), bx2 - bx1, by2 - by1, linewidth=2.4, edgecolor=col, facecolor=col, alpha=0.22))
             ax.text(
-                bx1 + 4, max(16, by1 - 6),
-                f"{b.get('label', 'Otpad')} ({score:.0%})",
+                bx1 + 4, max(16, by1 - 6), f"{b.get('label', 'Otpad')} ({score:.0%})",
                 color="white", fontsize=8, fontweight="bold",
                 bbox=dict(facecolor=col, alpha=0.85, pad=1.5, edgecolor="none")
             )
@@ -352,10 +365,7 @@ def render_geo_filter_view(
             if float(b.get("score", 0.0)) >= box_min_score:
                 bx1, by1, bx2, by2 = b["bbox_px"]
                 col = b.get("color", "#d62728")
-                ax.add_patch(patches.Rectangle(
-                    (bx1, by1), bx2 - bx1, by2 - by1,
-                    linewidth=2.2, edgecolor=col, facecolor="none"
-                ))
+                ax.add_patch(patches.Rectangle((bx1, by1), bx2 - bx1, by2 - by1, linewidth=2.2, edgecolor=col, facecolor="none"))
         ax.set_title("Geo Filter: Kombinirani prikaz (Toplinska mapa + Okviri hrpa)", fontsize=11, fontweight="bold", pad=10)
 
     plt.tight_layout()
@@ -369,26 +379,30 @@ def main():
     st.title("🛰️ EcoWarden Croatia — Sustav za nadzor divljih odlagališta")
     st.caption("Interaktivni pregled DGU DOF5 ortofoto snimaka (50 cm/px) pomoću 5-modelnog AI sustava i Geo Filtera.")
 
-    df_meta = load_lightweight_metadata()
+    df_meta, meta_parquet_path, boot_logs = load_lightweight_metadata()
+
+    with st.expander("🛠️ Dijagnostika sustava i status učitavanja", expanded=df_meta.empty):
+        for log_line in boot_logs:
+            st.write(f"- `{log_line}`")
+        st.write(f"- Predmemorija slika: aktiviran spremnik za zadnjih **10 lokacija** (sve godine odjednom).")
 
     if df_meta.empty:
-        st.error("Nema dostupnih podataka u Hugging Face repozitoriju.")
+        st.error("Nema dostupnih podataka. Provjerite dijagnostiku iznad.")
         return
 
+    if "selected_cluster_id" not in st.session_state:
+        st.session_state["selected_cluster_id"] = int(df_meta["cluster_id"].iloc[0])
+
     # --------------------------------------------------------------------------
-    # SIDEBAR: GLOBAL LOCATION, YEAR, SCANNER & STATUS FILTERS
+    # SIDEBAR FILTERS
     # --------------------------------------------------------------------------
     with st.sidebar:
-        st.header("📍 1. Odabir lokacije i vremena")
-
+        st.header("📍 1. Lokacija i Vrijeme")
         available_zup = ["Sve županije (Cijela Hrvatska)"] + sorted(df_meta["zupanija"].unique().tolist())
         selected_zup = st.selectbox("Županija / Regija:", available_zup)
 
         st.divider()
-        st.subheader("📅 Godina snimanja na karti")
-        st.caption("Automatski generirano prema dostupnim podacima (uključuje 2025/2026):")
-
-        # Dynamic value counts for years
+        st.subheader("📅 Godina snimanja")
         year_counts = df_meta["image_year"].value_counts().sort_index()
         selected_years = []
         for yr, count in year_counts.items():
@@ -396,16 +410,34 @@ def main():
                 selected_years.append(yr)
 
         st.divider()
+        st.subheader("🌲 Tip zemljišta (CORINE)")
+        available_corine = sorted(df_meta["corine_class"].dropna().unique().tolist())
+        selected_corine = st.multiselect("Filtriraj po tipu okoliša:", options=available_corine, default=available_corine)
+
+        st.divider()
         st.subheader("🤖 Filtriranje po AI skeneru")
         selected_scanner = st.selectbox(
             "Prikaz snimaka prema detekciji skenera:",
             options=[
                 "Svi skeneri zajedno (Komitet 5 modela)",
-                "Samo AerialWaste (Toplinska deponija)",
+                "Samo AerialWaste (Toplinska mapa / CAM >= 50%)",
                 "Samo SigLIP / SkyCLIP (Tekstura tla / Rubble)",
                 "Samo Detektori objekata (OWLv2 / YOLO-World hrpe)"
             ]
         )
+
+        st.divider()
+        st.subheader("📐 Veličina sumnjive zone")
+        size_metric_col = st.radio(
+            "Mjera površine:",
+            options=["max_detected_area_m2", "aw_hotspot_area_m2", "siglip_out10_suspect_area_m2"],
+            format_func=lambda c: (
+                "Maksimalna detektirana površina (bilo koji model)" if c == "max_detected_area_m2"
+                else ("AerialWaste CAM žarište (m²)" if c == "aw_hotspot_area_m2" else "SigLIP sumnjiva površina pločica (m²)")
+            )
+        )
+        max_possible_area = int(min(15000, df_meta[size_metric_col].max())) if not df_meta.empty else 5000
+        min_size_m2 = st.slider("Minimalna površina (m²):", 0, max(500, max_possible_area), 0, 50)
 
         st.divider()
         st.header("🚦 Status AI provjere")
@@ -417,18 +449,25 @@ def main():
             format_func=lambda b: TRIAGE_UI_MAP[b]["label"]
         )
 
-    # Filter metadata for the Macro Map
+        max_map_pins = st.slider("Maksimalan broj točaka na karti (za brzinu):", 100, 1500, 500, 100)
+
+    # Apply Sidebar Filters
     df_filtered = df_meta[
         (df_meta["image_year"].isin(selected_years)) &
+        (df_meta["corine_class"].isin(selected_corine)) &
+        (df_meta[size_metric_col] >= min_size_m2) &
         (df_meta["ens_triage_bucket"].isin(selected_buckets))
     ].copy()
 
     if selected_zup != "Sve županije (Cijela Hrvatska)":
         df_filtered = df_filtered[df_filtered["zupanija"] == selected_zup]
 
-    # Specific scanner isolation filter logic
-    if selected_scanner == "Samo AerialWaste (Toplinska deponija)":
-        df_filtered = df_filtered[df_filtered["aw_out1_global_waste_prob"] >= 0.40]
+    # Updated AerialWaste filter uses CAM peak or global prob so hotspots aren't missed!
+    if selected_scanner == "Samo AerialWaste (Toplinska mapa / CAM >= 50%)":
+        df_filtered = df_filtered[
+            (df_filtered["aw_out3_cam_global_max"] >= 0.50) |
+            (df_filtered["aw_out1_global_waste_prob"] >= 0.40)
+        ]
     elif selected_scanner == "Samo SigLIP / SkyCLIP (Tekstura tla / Rubble)":
         df_filtered = df_filtered[
             (df_filtered["siglip_out6_total_waste_max"] >= 0.45) |
@@ -440,138 +479,128 @@ def main():
             (df_filtered["yoloworld_out9_total_waste_max_score"] >= 0.20)
         ]
 
-    # Sort by Active Learning Priority Score
     df_filtered = df_filtered.sort_values(by="ens_active_learning_score", ascending=False).reset_index(drop=True)
 
     # --------------------------------------------------------------------------
-    # TOP SECTION: MACRO MAP & SUMMARY KPIs
+    # TOP SECTION: SUMMARY KPIS & FOLIUM MAP (SAFE CLICK-TO-LOAD)
     # --------------------------------------------------------------------------
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("Ukupno snimaka u prikazu", len(df_filtered))
-    kpi2.metric("Unikatnih ELOO lokacija (Clustera)", df_filtered["cluster_id"].nunique())
-    kpi3.metric(
-        "🟠 Zahtijeva ljudsku provjeru",
-        int((df_filtered["ens_triage_bucket"] == "ROUTE_TO_CROWD_DISAGREEMENT").sum())
+    kpi1.metric("Ukupno snimaka u filteru", len(df_filtered))
+    kpi2.metric("Unikatnih ELOO lokacija", df_filtered["cluster_id"].nunique())
+    kpi3.metric("🟠 Zahtijeva provjeru", int((df_filtered["ens_triage_bucket"] == "ROUTE_TO_CROWD_DISAGREEMENT").sum()))
+    kpi4.metric("🔴 Potvrđeni otpad", int((df_filtered["ens_triage_bucket"] == "AUTO_VERIFIED_WASTE").sum()))
+
+    if df_filtered.empty:
+        st.warning("Nema lokacija za odabrane filtere. Pokušajte proširiti filtere u bočnoj traci.")
+        return
+
+    # Deduplicate by cluster_id for the map & dropdown (1 pin per physical ELOO location)
+    cluster_summary = (
+        df_filtered.drop_duplicates(subset=["cluster_id"], keep="first")
+        .copy()
+        .reset_index(drop=True)
     )
-    kpi4.metric(
-        "🔴 Automatski potvrđen otpad",
-        int((df_filtered["ens_triage_bucket"] == "AUTO_VERIFIED_WASTE").sum())
-    )
+
+    if st.session_state["selected_cluster_id"] not in cluster_summary["cluster_id"].values:
+        st.session_state["selected_cluster_id"] = int(cluster_summary["cluster_id"].iloc[0])
 
     col_map, col_selector = st.columns([2.2, 1])
 
     with col_selector:
-        st.subheader("🎯 Odaberi lokaciju za inspekciju")
-        if df_filtered.empty:
-            st.warning("Nema lokacija za odabrane filtere.")
-            return
-
-        cluster_summary = (
-            df_filtered.groupby("cluster_id", as_index=False)
-            .first()[["cluster_id", "corine_class", "status_short", "ens_active_learning_score", "zupanija"]]
-            .sort_values(by="ens_active_learning_score", ascending=False)
-        )
+        st.subheader("🎯 Odaberi lokaciju")
+        cid_list = cluster_summary["cluster_id"].astype(int).tolist()
 
         selected_cluster_id = st.selectbox(
             "Odaberi ELOO Lokaciju (Cluster ID):",
-            options=cluster_summary["cluster_id"].tolist(),
-            format_func=lambda cid: (
-                f"Lokacija #{cid} | "
-                f"{cluster_summary.loc[cluster_summary['cluster_id']==cid, 'status_short'].values[0]} "
-                f"({cluster_summary.loc[cluster_summary['cluster_id']==cid, 'corine_class'].values[0][:22]}...)"
-            )
+            options=cid_list,
+            index=cid_list.index(int(st.session_state["selected_cluster_id"])),
+            format_func=lambda cid: f"Lokacija #{cid}"
         )
+        st.session_state["selected_cluster_id"] = int(selected_cluster_id)
 
         df_cluster_history = df_meta[df_meta["cluster_id"] == selected_cluster_id].sort_values("image_year")
 
-        st.markdown("**📅 Povijest širenja na ovoj lokaciji:**")
-        history_chart_df = df_cluster_history[["image_year", "siglip_out10_suspect_area_m2"]].set_index("image_year")
-        history_chart_df.columns = ["Sumnjiva površina (m²)"]
-        st.bar_chart(history_chart_df, height=180, color="#ff7f0e")
+        st.markdown("**📅 Povijest sumnjive površine kroz godine (m²):**")
+        history_chart_df = df_cluster_history[["image_year", "max_detected_area_m2"]].set_index("image_year")
+        history_chart_df.columns = ["Maks. detektirana površina (m²)"]
+        st.bar_chart(history_chart_df, height=190, color="#ff7f0e")
 
     with col_map:
+        st.caption(f"🗺️ Interaktivna karta (prikazano top {min(len(cluster_summary), max_map_pins)} lokacija po prioritetu — **kliknite na točku za učitavanje**):")
         active_lat = float(df_cluster_history.iloc[-1]["centroid_lat"])
         active_lon = float(df_cluster_history.iloc[-1]["centroid_lon"])
 
-        # Free Esri Satellite Background Layer so map isn't just blank dots
-        satellite_layer = pdk.Layer(
-            "TileLayer",
-            data="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            min_zoom=0,
+        m = folium.Map(location=[active_lat, active_lon], zoom_start=11, tiles=None)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery",
+            name="Satelitska snimka",
             max_zoom=19,
-            tile_size=256,
+        ).add_to(m)
+
+        # Limit markers to max_map_pins so WebSocket never crashes
+        map_subset = cluster_summary.head(max_map_pins)
+        for row in map_subset.itertuples():
+            cid = int(row.cluster_id)
+            is_active = (cid == selected_cluster_id)
+            folium.CircleMarker(
+                location=[row.centroid_lat, row.centroid_lon],
+                radius=10 if is_active else 6,
+                color="#ffffff" if is_active else row.color_hex,
+                weight=3 if is_active else 1,
+                fill=True,
+                fill_color=row.color_hex,
+                fill_opacity=0.9,
+                tooltip=f"Lokacija #{cid} | {row.status_short} | Max površina: {row.max_detected_area_m2:.0f} m²",
+            ).add_to(m)
+
+        # CRITICAL FIX: returned_objects=["last_object_clicked"] prevents map scroll/zoom from resetting the app!
+        map_data = st_folium(
+            m,
+            height=420,
+            use_container_width=True,
+            returned_objects=["last_object_clicked"]
         )
 
-        scatter_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=df_filtered,
-            get_position=["centroid_lon", "centroid_lat"],
-            get_fill_color="color_rgba",
-            get_radius=180,
-            radius_min_pixels=6,
-            radius_max_pixels=18,
-            pickable=True,
-            auto_highlight=True,
-        )
-
-        highlight_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=df_cluster_history.tail(1),
-            get_position=["centroid_lon", "centroid_lat"],
-            get_fill_color=[0, 0, 0, 0],
-            get_line_color=[255, 255, 255, 255],
-            get_radius=320,
-            radius_min_pixels=12,
-            radius_max_pixels=26,
-            stroked=True,
-            line_width_min_pixels=3,
-        )
-
-        view_state = pdk.ViewState(latitude=active_lat, longitude=active_lon, zoom=11.5, pitch=0)
-        tooltip = {
-            "html": (
-                "<b>Lokacija (Cluster):</b> #{cluster_id}<br/>"
-                "<b>Godina snimke:</b> {image_year}<br/>"
-                "<b>Status:</b> {status_short}<br/>"
-                "<b>Sumnjiva površina:</b> {siglip_out10_suspect_area_m2} m²<br/>"
-                "<b>Zemljište (CORINE):</b> {corine_class}"
-            ),
-            "style": {"backgroundColor": "#1e1e1e", "color": "white", "fontSize": "12px"}
-        }
-
-        st.pydeck_chart(pdk.Deck(
-            layers=[satellite_layer, scatter_layer, highlight_layer],
-            initial_view_state=view_state,
-            tooltip=tooltip,
-            map_style=None
-        ))
+        if map_data and map_data.get("last_object_clicked"):
+            click_lat = map_data["last_object_clicked"]["lat"]
+            click_lon = map_data["last_object_clicked"]["lng"]
+            dists = (cluster_summary["centroid_lat"] - click_lat) ** 2 + (cluster_summary["centroid_lon"] - click_lon) ** 2
+            nearest_cid = int(cluster_summary.loc[dists.idxmin(), "cluster_id"])
+            if nearest_cid != st.session_state["selected_cluster_id"]:
+                st.session_state["selected_cluster_id"] = nearest_cid
+                st.rerun()
 
     st.divider()
 
     # --------------------------------------------------------------------------
-    # BOTTOM SECTION: WARDEN INSPECTION DESK & "GEO FILTERS"
+    # BOTTOM SECTION: INSPECTION DESK & 10-LOCATION CACHED GEO FILTERS
     # --------------------------------------------------------------------------
     st.header(f"🔍 Inspekcijski stol: Lokacija #{selected_cluster_id}")
+
+    # Pre-fetch & cache all years for this cluster_id (keeps last 10 locations in memory!)
+    cluster_bucket = fetch_cluster_cache_bucket(selected_cluster_id, meta_parquet_path)
 
     cluster_years = df_cluster_history["image_year"].tolist()
     if len(cluster_years) > 1:
         selected_img_year = st.select_slider(
-            "⏳ Vremenski klizač (Odaberite godinu ortofoto snimke za usporedbu):",
+            "⏳ Vremenski klizač (Trenutni prijelaz između već učitanih godina):",
             options=cluster_years,
             value=cluster_years[-1]
         )
     else:
         selected_img_year = cluster_years[0]
-        st.info(f"📅 Za ovu lokaciju dostupna je snimka iz godine: **{selected_img_year}**")
+        st.info(f"📅 Dostupna snimka iz godine: **{selected_img_year}**")
 
     active_row = df_cluster_history[df_cluster_history["image_year"] == selected_img_year].iloc[0]
+    active_payload = cluster_bucket.get(active_row["file_name"], {})
     bucket_info = TRIAGE_UI_MAP.get(active_row["ens_triage_bucket"], TRIAGE_UI_MAP["ROUTE_TO_CROWD_AMBIGUOUS"])
 
     desk_left, desk_right = st.columns([1.6, 1])
 
     with desk_left:
         active_filter = st.radio(
-            "🎨 Odaberi Geo Filter (Pogled kroz oči AI skenera):",
+            "🎨 Odaberi Geo Filter (Trenutni prijelaz bez ponovnog učitavanja):",
             options=[
                 "📸 Originalna snimka",
                 "🔥 Toplinska mapa (Heatmap)",
@@ -586,25 +615,11 @@ def main():
         tile_thresh = 0.45
         if active_filter == "🟩 Skener terena (Pločice)":
             sub_c1, sub_c2 = st.columns(2)
-            pyramid_scale = sub_c1.selectbox(
-                "Veličina mreže skenera:",
-                options=["L0_384px", "L1_768px", "Sve razine"],
-                format_func=lambda x: "Detaljna mreža (L0 - 384px)" if x == "L0_384px" else ("Širi kontekst (L1 - 768px)" if x == "L1_768px" else "Sve razine")
-            )
-            tile_thresh = sub_c2.slider("Prag osjetljivosti skenera:", 0.20, 0.90, 0.45, 0.05)
-
-        state_key = f"{active_row['chunk_id']}_{active_row['file_name']}"
-        if st.session_state.get("loaded_image_key") != state_key:
-            with st.spinner(f"Preuzimanje ortofoto snimke {active_row['file_name']}..."):
-                st.session_state["loaded_payload"] = fetch_single_image_payload(
-                    chunk_id=active_row["chunk_id"],
-                    file_name=active_row["file_name"],
-                    repo_id=active_row.get("_source_repo", PROD_REPO_ID)
-                )
-                st.session_state["loaded_image_key"] = state_key
+            pyramid_scale = sub_c1.selectbox("Veličina mreže:", options=["L0_384px", "L1_768px", "Sve razine"])
+            tile_thresh = sub_c2.slider("Prag osjetljivosti:", 0.20, 0.90, 0.45, 0.05)
 
         fig = render_geo_filter_view(
-            payload=st.session_state["loaded_payload"],
+            payload=active_payload,
             meta_row=active_row,
             active_filter=active_filter,
             pyramid_scale=pyramid_scale,
@@ -615,9 +630,8 @@ def main():
 
     with desk_right:
         st.subheader("🧠 Što AI modeli vide na ovoj snimci?")
-
         st.markdown(
-            f"<div style='padding:14px; border-radius:8px; border-left: 6px solid {bucket_info['hex']}; background-color: rgba(128,128,128,0.1);'>"
+            f"<div style='padding:14px; border-radius:8px; border-left: 6px solid {bucket_info['color']}; background-color: rgba(128,128,128,0.1);'>"
             f"<h4 style='margin:0;'>{bucket_info['label']}</h4>"
             f"<p style='margin-top:8px; margin-bottom:0; font-size:14px;'>{bucket_info['explanation']}</p>"
             f"</div>",
@@ -630,80 +644,54 @@ def main():
         m2.metric("Neslaganje između modela", f"{active_row['disagreement_pct']}%")
 
         m3, m4 = st.columns(2)
-        m3.metric("Dominantni tip (AI procjena)", str(active_row["siglip_out11_primary_waste_type"]))
-        m4.metric("Sumnjiva površina terena", f"{active_row['siglip_out10_suspect_area_m2']:.0f} m²")
+        m3.metric("Dominantni tip (AI)", str(active_row["siglip_out11_primary_waste_type"]))
+        m4.metric("Maks. detektirana površina", f"{active_row['max_detected_area_m2']:.0f} m²")
 
-        with st.expander("📊 Detaljni rezultati po vrsti AI skenera (za dublju analizu)", expanded=True):
-            st.caption("Usporedba kako različite vrste umjetne inteligencije tumače ovu snimku:")
+        with st.expander("📊 Detaljni rezultati po vrsti AI skenera", expanded=True):
+            st.caption("Vršni (lokalni) rezultati po pojedinom skeneru na ovoj snimci:")
             st.progress(
                 float(np.clip(active_row["siglip_out6_total_waste_max"], 0.0, 1.0)),
-                text=f"Skener teksture tla (SigLIP): {active_row['siglip_out6_total_waste_max']:.0%}"
+                text=f"Skener teksture tla (SigLIP): {active_row['siglip_out6_total_waste_max']:.0%} ({active_row['siglip_out10_suspect_area_m2']:.0f} m²)"
             )
             st.progress(
                 float(np.clip(active_row["skyclip_out6_total_waste_max"], 0.0, 1.0)),
-                text=f"Satelitski skener terena (SkyCLIP): {active_row['skyclip_out6_total_waste_max']:.0%}"
+                text=f"Satelitski skener (SkyCLIP): {active_row['skyclip_out6_total_waste_max']:.0%}"
             )
+            # Uses Peak CAM intensity (aw_out3_cam_global_max) so it matches the Heatmap!
+            aw_peak = float(np.clip(active_row.get("aw_out3_cam_global_max", active_row["aw_out1_global_waste_prob"]), 0.0, 1.0))
             st.progress(
-                float(np.clip(active_row["aw_out1_global_waste_prob"], 0.0, 1.0)),
-                text=f"Detektor globalne deponije (AerialWaste): {active_row['aw_out1_global_waste_prob']:.0%}"
+                aw_peak,
+                text=f"Toplinska mapa (AerialWaste CAM vrh): {aw_peak:.0%} (Žarište: {active_row['aw_hotspot_area_m2']:.0f} m² | Globalno: {active_row['aw_out1_global_waste_prob']:.0%})"
             )
             st.progress(
                 float(np.clip(active_row["owlv2_out9_total_waste_max_score"], 0.0, 1.0)),
-                text=f"Detektor pojedinačnih hrpa (OWLv2): {active_row['owlv2_out9_total_waste_max_score']:.0%} ({active_row['owlv2_out10_total_waste_box_count']} okvira)"
+                text=f"Detektor hrpa (OWLv2): {active_row['owlv2_out9_total_waste_max_score']:.0%} ({active_row['owlv2_out10_total_waste_box_count']} okvira)"
             )
             st.progress(
                 float(np.clip(active_row["yoloworld_out9_total_waste_max_score"], 0.0, 1.0)),
-                text=f"Brzi detektor objekata (YOLO-World): {active_row['yoloworld_out9_total_waste_max_score']:.0%} ({active_row['yoloworld_out10_total_waste_box_count']} okvira)"
+                text=f"Detektor objekata (YOLO-World): {active_row['yoloworld_out9_total_waste_max_score']:.0%} ({active_row['yoloworld_out10_total_waste_box_count']} okvira)"
             )
 
-        # Force Satellite Map Type in Google Maps URL via `data=!3m1!1e3`
         gmaps_url = f"https://www.google.com/maps/@{active_row['centroid_lat']},{active_row['centroid_lon']},18z/data=!3m1!1e3"
-
         st.markdown(
-            f"**Kategorija zemljišta (CORINE):** {active_row['corine_class']}  \n"
-            f"**GPS Koordinate (WGS84):** `{active_row['centroid_lat']:.6f}, {active_row['centroid_lon']:.6f}`  \n"
-            f"[🌍 Otvori lokaciju u Google Maps (Satelitski prikaz)]({gmaps_url})"
+            f"**CORINE Tip:** {active_row['corine_class']}  \n"
+            f"**GPS:** `{active_row['centroid_lat']:.6f}, {active_row['centroid_lon']:.6f}`  \n"
+            f"[🌍 Otvori u Google Maps (Satelitski prikaz)]({gmaps_url})"
         )
 
         st.divider()
-        st.subheader("✍️ Odluka komunalnog redara / Wardena")
-        st.caption("Pomozite sustavu da nauči razlikovati stvarni otpad od lažnih alarma (automobila, krovova, krša):")
-
-        warden_note = st.text_input("Kratka napomena (opcionalno, npr. 'Žuti auto na parkiralištu' ili 'Građevinski šut uz šumu'):")
-
-        b_col1, b_col2, b_col3 = st.columns(3)
+        st.subheader("✍️ Odluka komunalnog redara")
         verdict = None
-        if b_col1.button("✅ Potvrdi otpad", use_container_width=True, type="primary"):
+        col_b1, col_b2, col_b3 = st.columns(3)
+        if col_b1.button("✅ Potvrdi otpad", use_container_width=True, type="primary"):
             verdict = "CONFIRMED_WASTE"
-        if b_col2.button("🚗 Lažni alarm", use_container_width=True):
-            verdict = "FALSE_ALARM_URBAN_OR_CAR"
-        if b_col3.button("🌲 Čisto", use_container_width=True):
-            verdict = "CLEAN_NATURE"
+        if col_b2.button("🚗 Lažni alarm", use_container_width=True):
+            verdict = "FALSE_ALARM"
+        if col_b3.button("🌲 Čisto", use_container_width=True):
+            verdict = "CLEAN"
 
         if verdict:
-            log_entry = {
-                "timestamp": datetime.utcnow().isoformat(),
-                "file_name": active_row["file_name"],
-                "cluster_id": int(active_row["cluster_id"]),
-                "image_year": str(active_row["image_year"]),
-                "ai_triage_bucket": active_row["ens_triage_bucket"],
-                "warden_verdict": verdict,
-                "note": warden_note
-            }
-            if "warden_logs" not in st.session_state:
-                st.session_state["warden_logs"] = []
-            st.session_state["warden_logs"].append(log_entry)
-            st.success(f"Zabilježena odluka: **{verdict}** za `{active_row['file_name']}`!")
-
-        if st.session_state.get("warden_logs"):
-            df_logs = pd.DataFrame(st.session_state["warden_logs"])
-            st.download_button(
-                "📥 Preuzmi zapisnik provjera (CSV)",
-                data=df_logs.to_csv(index=False).encode("utf-8"),
-                file_name="ecowarden_verifikacije.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            st.success(f"Zabilježeno: {verdict}")
 
 
 if __name__ == "__main__":
